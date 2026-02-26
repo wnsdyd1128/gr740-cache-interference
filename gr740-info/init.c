@@ -1,0 +1,24 @@
+/*
+ * Simple RTEMS configuration
+ */
+
+#include <rtems.h>
+#include <rtems/test-info.h>
+#include <rtems/test.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#define CONFIGURE_APPLICATION_NEEDS_SIMPLE_CONSOLE_DRIVER
+#define CONFIGURE_APPLICATION_NEEDS_CLOCK_DRIVER
+#define CONFIGURE_MAXIMUM_PROCESSORS 4
+
+#define CONFIGURE_UNLIMITED_OBJECTS
+#define CONFIGURE_UNIFIED_WORK_AREAS
+#define CONFIGURE_INIT_TASK_ATTRIBUTES RTEMS_FLOATING_POINT
+#define CONFIGURE_ENABLE_FLOATING_POINT
+
+#define CONFIGURE_INITIAL_EXTENSIONS RTEMS_TEST_INITIAL_EXTENSION
+#define CONFIGURE_RTEMS_INIT_TASKS_TABLE
+#define CONFIGURE_INIT
+
+#include <rtems/confdefs.h>
