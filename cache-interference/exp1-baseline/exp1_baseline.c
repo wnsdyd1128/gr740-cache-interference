@@ -4,11 +4,12 @@
 #include <rtems/rtems/cache.h>
 #include <rtems/rtems/status.h>
 #include <rtems/rtems/tasks.h>
+#include <stdint.h>
 
 #include "experiment_common.h"
 #include "expr_configure.h"
 
-/*=====================================================================
+/** =====================================================================
  * Experiment 1: Solo vs Interference — L1 / L2 / L1+L2 separation
  *
  * Purpose: isolate each cache interference layer independently and
@@ -38,7 +39,7 @@
  *   (b) cross-core L2 bandwidth contention, or (c) aggregate L2
  *   pressure from N concurrent tasks.  The CPI delta observed here
  *   is invisible to the CAAS scheduler.
- *=====================================================================*/
+ *===================================================================== **/
 
 static volatile uint8_t exp1_worker_buf[WS_FULL_SIZE]
   __attribute__((aligned(4096)));
@@ -78,36 +79,69 @@ static rtems_task exp1_periodic_task(rtems_task_argument arg)
    * labels only; the returned period_id is the actual unique handle.       */
   char idx = (char)('0' + ta->task_name_idx);
 
-  // Warm-up
-  cache_workload(ta->array, ta->size);
   rtems_rate_monotonic_create(rtems_build_name('E', '1', 'P', idx), &period_id);
+  int sweeps = ta->stats->role == TASK_ROLE_WORKER
+                 ? NUM_STRESS_ITERATIONS_WORKER
+                 : NUM_STRESS_ITERATIONS_INTERFERER;
+
+  uint64_t loop_overhead_start = rtems_clock_get_uptime_nanoseconds();
+  empty_workload(ta->array, ta->size, sweeps);
+  uint64_t loop_overhead_end = rtems_clock_get_uptime_nanoseconds();
+
+  ta->stats->loop_overhead_ns = loop_overhead_end - loop_overhead_start;
+
+#ifdef ENABLE_CACHE_WARMUP
+  if (ta->stats->is_load_op == LOAD_OP)
+  {
+    load_workload(ta->array, ta->size, sweeps);
+  }
+#endif
+  uint64_t start_time = rtems_clock_get_uptime_nanoseconds();
   for (int iter = 0; iter < NUM_TASK_ITERATIONS; iter++)
   {
+    /* ignore missed period for simplicity; just run the workload immediately */
     if (rtems_rate_monotonic_period(period_id, TASK_PERIOD_TICKS) ==
         RTEMS_TIMEOUT)
     {
-      break;
+      printf("Task %d missed period at iteration %d.\n", ta->task_name_idx,
+             iter);
+      exit(1);
     }
+
     // Verify affinity: task must always run on the core it was pinned to.
     // printf("Running %s task %d on CPU %d\n",
     //        ta->stats->role == TASK_ROLE_WORKER ? "WORKER" : "INTERFERER",
     //        ta->stats->task_idx, rtems_scheduler_get_processor());
     assert((int)rtems_scheduler_get_processor() == ta->expected_cpu);
+
     /* TAT start: job release point (period boundary) */
     uint64_t t0 = rtems_clock_get_uptime_nanoseconds();
-    cache_workload(ta->array, ta->size);
+    if (ta->stats->op_type == LOAD_OP)
+    {
+      load_workload(ta->array, ta->size, sweeps);
+    }
+    else if (ta->stats->op_type == STORE_OP)
+    {
+      store_workload(ta->array, ta->size, sweeps);
+    }
+    else
+    {
+      rmw_workload(ta->array, ta->size, sweeps);
+    }
     /* TAT end: workload (job body) complete */
     uint64_t t1 = rtems_clock_get_uptime_nanoseconds();
+    uint64_t exec_ns = t1 - t0;
     if (ta->stats != NULL)
     {
-      // ta->stats->tat_ns[iter] = t1 - t0;
-      record_tat(ta->stats, t1 - t0);
+      record_tat(ta->stats, exec_ns);
     }
   }
-  // if (ta->stats != NULL)
-  // {
-  //   ta->stats->n_samples = NUM_TASK_ITERATIONS;
-  // }
+  uint64_t end_time = rtems_clock_get_uptime_nanoseconds();
+  uint64_t total_exec = end_time - start_time;
+  if (ta->stats != NULL)
+  {
+    ta->stats->total_exec_ns = total_exec;
+  }
 
   if ((status = rtems_rate_monotonic_delete(period_id)) != 0)
   {
@@ -118,7 +152,7 @@ static rtems_task exp1_periodic_task(rtems_task_argument arg)
 }
 
 static void run_single_worker(volatile uint8_t * buf, int size, int cpu,
-                              const char * label)
+                              op_type_t op_type, const char * label)
 {
   rtems_id sem_id, task_id;
 
@@ -129,6 +163,9 @@ static void run_single_worker(volatile uint8_t * buf, int size, int cpu,
   memset(&exp1_stats[0], 0, sizeof(task_stats_t));
   exp1_stats[0].role = TASK_ROLE_WORKER;
   exp1_stats[0].task_idx = 0;
+  exp1_stats[0].op_type = op_type;
+  exp1_stats[0].n_accesses =
+    NUM_STRESS_ITERATIONS_WORKER * (size / L1_LINE_SIZE);
 
   rtems_semaphore_create(rtems_build_name('D', 'N', '1', '0'), 0,
                          RTEMS_SIMPLE_BINARY_SEMAPHORE, 0, &sem_id);
@@ -159,7 +196,7 @@ static void run_single_worker(volatile uint8_t * buf, int size, int cpu,
 static void run_worker_with_interferers(volatile uint8_t * w_buf, int w_size,
                                         int w_cpu, volatile uint8_t ** i_bufs,
                                         int * i_sizes, int * i_cpus, int n_intf,
-                                        const char * label)
+                                        op_type_t op_type, const char * label)
 {
   rtems_id sem_id, task_ids[5];
   rtems_status_code status;
@@ -174,11 +211,19 @@ static void run_worker_with_interferers(volatile uint8_t * w_buf, int w_size,
   /* Initialise stats slots: index 0 = victim worker, 1..n = aggressors */
   memset(exp1_stats, 0, sizeof(task_stats_t) * (size_t)total_tasks);
   exp1_stats[0].role = TASK_ROLE_WORKER;
+  exp1_stats[0].cpu_id = w_cpu;
   exp1_stats[0].task_idx = 0;
+  exp1_stats[0].op_type = op_type;
+  exp1_stats[0].n_accesses =
+    NUM_STRESS_ITERATIONS_WORKER * (w_size / L1_LINE_SIZE);
   for (int i = 0; i < n_intf; i++)
   {
     exp1_stats[1 + i].role = TASK_ROLE_INTERFERER;
+    exp1_stats[1 + i].cpu_id = i_cpus[i];
     exp1_stats[1 + i].task_idx = i;
+    exp1_stats[1 + i].op_type = op_type;
+    exp1_stats[1 + i].n_accesses =
+      NUM_STRESS_ITERATIONS_INTERFERER * (i_sizes[i] / L1_LINE_SIZE);
   }
 
   rtems_semaphore_create(rtems_build_name('D', 'N', '1', '1'), 0,
@@ -258,49 +303,52 @@ static void run_worker_with_interferers(volatile uint8_t * w_buf, int w_size,
   printf("--- %s: Done ---\n", label);
 }
 
-/*-----------------------------------------------------------------
+/** -----------------------------------------------------------------
  * A-1: Solo Baseline — no interference (reference measurement)
  *
  * Configuration:
- *   Worker      : WS_L1_FIT (~11.2 KiB), Core 0, Priority 10
+ *   Worker      : WS_L1_FIT (~11.2 KiB), Core 1, Priority 10, Load OP
  *   Interferer  : none
  *   Semaphore   : SIMPLE_BINARY (single waiter)
- *   Iterations  : NUM_TASK_ITERATIONS = 100, Period = 10 ticks
+ *   Iterations  : NUM_TASK_ITERATIONS = 10000, Period = 100 ticks
  *
  * Mechanism:
- *   Single task runs alone on Core 0.  Working-set fits within L1
+ *   Single task runs alone on Core 1.  Working-set fits within L1
  *   (11.2 KiB < 16 KiB), so every access is an L1 hit after the
  *   first iteration (warm-up).  No context switch, no eviction,
  *   no coherence traffic on the L2 bus.
  *
  * Expected result:
+ *   Observe: min/avg/max TAT (us), time_per_access (ns),
+ *   time_per_access_w/o_lo (ns), accumulated execution time (ns).
  *   Lowest TAT of all A-series scenarios; near-constant across
  *   iterations once cache is warm.  Use as the TAT reference
- *   to compute overhead percentage in A-2 through A-6.
+ *   to compute overhead percentage in A-2 through A-5.
  *
  * CAAS relevance:
  *   CA_i for this task is low (reuse distance << L1 capacity).
  *   CAAS would classify it as "cache-friendly" — consistent with
  *   the measured result.  No limitation exposed here; A-1 is the
  *   control condition.
- *-----------------------------------------------------------------*/
+ *----------------------------------------------------------------- **/
 void run_exp1_A1(void)
 {
-  run_single_worker(exp1_worker_buf, WS_L1_FIT, 0,
-                    "EXP1 A-1: Solo (L1 fit, Core 0)");
+  run_single_worker(exp1_worker_buf, WS_L1_FIT, 1, LOAD_OP,
+                    "EXP1 A-1: Solo (L1 fit, Core 1)");
 }
 
-/*-----------------------------------------------------------------
+/** -----------------------------------------------------------------
  * A-2: L1 Thrashing — same-core Round-Robin time-sharing
  *
  * Configuration:
- *   Worker      : WS_L1_FIT (~11.2 KiB), Core 0, Priority 10
- *   Interferer 1: WS_L1_FIT (~11.2 KiB), Core 0, Priority 10
+ *   Worker      : WS_L1_FIT (~11.2 KiB), Core 1, Priority 10, Load OP
+ *   Interferer 1: WS_L1_FIT (~11.2 KiB), Core 1, Priority 10, Load OP
  *   Semaphore   : COUNTING (2 waiters)
- *   Iterations  : NUM_TASK_ITERATIONS = 100, Period = 10 ticks
+ *   Iterations  : NUM_TASK_ITERATIONS = 10000, Period = 100 ticks
+ *   Mode        : RUN_SAFE → WS_L1_SAFE, STRESS → WS_L1_FIT
  *
  * Mechanism:
- *   Two tasks share Core 0 with equal priority → RTEMS EDF-SMP
+ *   Two tasks share Core 1 with equal priority → RTEMS EDF-SMP
  *   applies Round-Robin within the same period.  Each task's WS
  *   individually fits in L1, but their combined footprint is:
  *     2 × 11.2 KiB = 22.4 KiB  >  L1 capacity (16 KiB)
@@ -308,9 +356,11 @@ void run_exp1_A1(void)
  *   a cold-start reload on each scheduling quantum → L1 thrashing.
  *
  * Expected result:
- *   TAT for Worker significantly higher than A-1 (+30–80%),
- *   despite identical per-task WS.  Interferer shows symmetric
- *   overhead (it is also a victim of the Worker's evictions).
+ *   Observe: min/avg/max TAT (us), time_per_access (ns),
+ *   time_per_access_w/o_lo (ns), accumulated execution time (ns).
+ *   Worker TAT and time_per_access significantly elevated vs A-1
+ *   despite identical per-task WS; loop overhead subtraction
+ *   reveals true eviction-reload penalty.
  *
  * CAAS limitation (primary target):
  *   CAAS computes CA_i per task in isolation: WS_L1_FIT / L1 ≈ 0.7
@@ -318,19 +368,205 @@ void run_exp1_A1(void)
  *   combined-WS metric, so it cannot detect that co-scheduling them
  *   on the same core causes thrashing.  This is the core counter-
  *   example against CAAS's same-core placement decision.
- *-----------------------------------------------------------------*/
+ *----------------------------------------------------------------- **/
 void run_exp1_A2(void)
 {
+#ifdef RUN_SAFE
+  int ws_size = WS_L1_SAFE;
+  const char * label = "EXP1 A-2  (SAFE)  : L1 contention (same core RR)";
+#else
+  int ws_size = WS_L1_FIT;
+  const char * label = "EXP1 A-2 (STRESS) : L1 contention (same core RR)";
+#endif
   volatile uint8_t * i_bufs[] = {exp1_intf1_buf};
-  int i_sizes[] = {WS_L1_FIT};
+  int i_sizes[] = {ws_size};
   int i_cpus[] = {1};
 
-  run_worker_with_interferers(exp1_worker_buf, WS_L1_FIT, 1, i_bufs, i_sizes,
-                              i_cpus, 1,
-                              "EXP1 A-2: L1 contention (same core RR)");
+  run_worker_with_interferers(exp1_worker_buf, ws_size, 1, i_bufs, i_sizes,
+                              i_cpus, 1, LOAD_OP, label);
 }
 
-/*-----------------------------------------------------------------
+/** -----------------------------------------------------------------
+ * A-3: L2 Solo Baseline — single-core, L1-overflow working-set
+ *
+ * Configuration:
+ *   Worker      : WS_L1_EXCEED (~24 KiB), Core 1, Priority 10
+ *   Interferer  : None (Solo execution)
+ *   Semaphore   : SIMPLE_BINARY (single waiter)
+ *   Iterations  : NUM_TASK_ITERATIONS = 10000, Period = 100 ticks
+ *   Op types    : LOAD / STORE / RMW (measured separately)
+ *
+ * Mechanism:
+ *   A single task runs with a working set that intentionally exceeds
+ *   the L1 data cache capacity (150% of 16 KiB). This setup
+ *   guarantees 100% L1 capacity misses during continuous sweeps,
+ *   forcing heavy L2 cache accesses (32-byte Line Fills) via the
+ *   shared AHB bus. Since it runs in isolation on a single core,
+ *   there is zero cross-core bus contention or cache invalidation
+ *   traffic. The task completely monopolizes the memory subsystem.
+ *
+ * Expected result:
+ *   Observe: min/avg/max TAT (us), time_per_access (ns) per op type.
+ *   TAT inherently higher than A-1 (L1-fit) due to L2 access
+ *   latency. STORE TAT lowest (write-through bypasses L1 read path);
+ *   RMW TAT highest (read-modify-write doubles bus traffic).
+ *   Serves as the zero-contention reference for A-4 and A-5.
+ *
+ * CAAS limitation:
+ *   CA_i will correctly profile this task as having a large footprint
+ *   with negligible L1 reuse. While CAAS can model this solo
+ *   execution, this baseline exposes CAAS's blind spot: it assumes
+ *   this solo TAT will hold in multi-core deployments, failing to
+ *   predict AHB bandwidth degradation when another L2-bound task
+ *   is co-scheduled.
+ * ----------------------------------------------------------------- **/
+void run_exp1_A3(void)
+{
+  run_single_worker(exp1_worker_buf, WS_L1_EXCEED, 1, RMW_OP,
+                    "EXP1 A-3: Solo with RMW (L2 Solo, Core 1)");
+}
+
+/** -----------------------------------------------------------------
+ * A-4: L2 Saturation — Shared Bus Bandwidth & Coherence Overhead
+ *
+ * Configuration:
+ *   Worker      : WS_L1_EXCEED (~24 KiB), Core 0, Priority 10
+ *   Interferer 1: WS_L1_EXCEED (~24 KiB), Core 1, Priority 10
+ *   Data Arrays : Independent (Worker uses w_buf, Interferer uses i_buf)
+ *   Iterations  : NUM_TASK_ITERATIONS = 10000, Period = 100 ticks
+ *   Op types    : LOAD / STORE / RMW (measured separately)
+ *
+ * Mechanism:
+ *   Two cores simultaneously execute independent operations on
+ *   separate arrays. Each task's working set (24 KiB) overflows L1,
+ *   forcing continuous L2 Cache Line Fills via the shared AHB bus.
+ *   Combined footprint (48 KiB) stays well within L2 capacity (2 MiB),
+ *   so there are no L2 capacity misses. For STORE/RMW, write-through
+ *   from both cores saturates the shared write buffer simultaneously.
+ *
+ * Expected result:
+ *   Observe: min/avg/max TAT (us), time_per_access (ns) per op type,
+ *   delta vs A-3 (solo) for each op type.
+ *   LOAD TAT elevated vs A-3 due to AHB arbitration contention.
+ *   STORE TAT only marginally higher (write buffer absorbs traffic).
+ *   RMW TAT shows largest absolute delta, combining both read and
+ *   write bus contention penalties.
+ *
+ * CAAS limitation:
+ *   CAAS correctly profiles both tasks as not thrashing L2 capacity.
+ *   However, CAAS lacks a metric for shared-bus bandwidth saturation,
+ *   wrongly assuming that co-scheduling them on different cores is
+ *   interference-free.
+ *----------------------------------------------------------------- **/
+void run_exp1_A4(void)
+{
+#if NUM_INTERFERERS == 3
+  volatile uint8_t * i_bufs[] = {exp1_intf1_buf, exp1_intf2_buf,
+                                 exp1_intf3_buf};
+  int i_sizes[] = {WS_L2_SAFE, WS_L2_SAFE, WS_L2_SAFE};
+  int i_cpus[] = {1, 2, 3};
+#elif NUM_INTERFERERS == 1
+  volatile uint8_t * i_bufs[] = {exp1_intf1_buf};
+  int i_sizes[] = {WS_L1_EXCEED};
+  int i_cpus[] = {1};
+#endif
+
+  char label_buf[100];
+#ifdef ENABLE_CACHE_WARMUP
+  snprintf(label_buf, sizeof(label_buf),
+           "EXP1 A-4: L2 Saturation with load (%d-Core), warmup enabled",
+           NUM_INTERFERERS + 1);
+#else
+  op_type_t op_type = RMW_OP;
+  if (op_type == LOAD_OP)
+  {
+    snprintf(label_buf, sizeof(label_buf),
+             "EXP1 A-4: L2 Saturation with load (%d-Core)",
+             NUM_INTERFERERS + 1);
+  }
+  else if (op_type == STORE_OP)
+  {
+    snprintf(label_buf, sizeof(label_buf),
+             "EXP1 A-4: L2 Saturation with store (%d-Core)",
+             NUM_INTERFERERS + 1);
+  }
+  else
+  {
+    snprintf(label_buf, sizeof(label_buf),
+             "EXP1 A-4: L2 Saturation with RMW (%d-Core)", NUM_INTERFERERS + 1);
+  }
+#endif
+  run_worker_with_interferers(exp1_worker_buf, WS_L1_EXCEED, 0, i_bufs, i_sizes,
+                              i_cpus, NUM_INTERFERERS, op_type, label_buf);
+}
+
+/** -----------------------------------------------------------------
+ * A-5: L2 Thrash — Memory Bottleneck & DRAM Latency
+ *
+ * Configuration:
+ *   Worker      : WS_L2_PRESSURE (~819 KiB), Core 0, Priority 10
+ *   Interferer 1: WS_L2_PRESSURE (~819 KiB), Core 1, Priority 10
+ *   Data Arrays : Independent (Each task accesses its own separate array)
+ *   Iterations  : NUM_TASK_ITERATIONS = 10000, Period = 100 ticks
+ *   Op types    : LOAD / STORE / RMW (measured separately)
+ *   (NUM_INTERFERERS=3 variant: 4 cores, combined WS ~3.27 MiB)
+ *
+ * Mechanism:
+ *   Two (or four) cores simultaneously stream WS_L2_PRESSURE through
+ *   their L1 caches and into the shared L2. Combined working set
+ *   exceeds the L2 capacity (2 MiB), forcing catastrophic L2 capacity
+ *   misses and DRAM fetches. Unlike A-4, this scenario saturates both
+ *   the L2 eviction path and the external memory controller.
+ *
+ * Expected result:
+ *   Observe: min/avg/max TAT (us), time_per_access (ns), n_accesses,
+ *   accumulated execution time (ns) per op type.
+ *   TAT and time_per_access show extreme non-linear degradation
+ *   vs A-3 (solo), exposing the DRAM bottleneck that CAAS cannot
+ *   predict from single-task profiling alone.
+ *
+ * CAAS limitation:
+ *   CAAS may recommend partitioned placement for high-footprint tasks
+ *   (each on its own core) — exactly this configuration. Yet the
+ *   combined L2 pressure still causes catastrophic TAT inflation
+ *   because CAAS has no aggregate cross-core footprint metric.
+ *----------------------------------------------------------------- **/
+void run_exp1_A5(void)
+{
+#if NUM_INTERFERERS == 3
+  volatile uint8_t * i_bufs[] = {exp1_intf1_buf, exp1_intf2_buf,
+                                 exp1_intf3_buf};
+  int i_sizes[] = {WS_L2_SAFE, WS_L2_SAFE, WS_L2_SAFE};
+  int i_cpus[] = {1, 2, 3};
+#elif NUM_INTERFERERS == 1
+  volatile uint8_t * i_bufs[] = {exp1_intf1_buf};
+  int i_sizes[] = {WS_L2_PRESSURE};
+  int i_cpus[] = {1};
+#endif
+  char label_buf[100];
+  op_type_t op_type = RMW_OP;
+  if (op_type == LOAD_OP)
+  {
+    snprintf(label_buf, sizeof(label_buf),
+             "EXP1 A-5: L2 Thrash with load (%d-Core)", NUM_INTERFERERS + 1);
+  }
+  else if (op_type == STORE_OP)
+  {
+    snprintf(label_buf, sizeof(label_buf),
+             "EXP1 A-5: L2 Thrash with store (%d-Core)", NUM_INTERFERERS + 1);
+  }
+  else
+  {
+    snprintf(label_buf, sizeof(label_buf),
+             "EXP1 A-5: L2 Thrash with RMW (%d-Core)", NUM_INTERFERERS + 1);
+  }
+  run_worker_with_interferers(exp1_worker_buf, WS_L2_PRESSURE, 0, i_bufs,
+                              i_sizes, i_cpus, NUM_INTERFERERS, op_type,
+                              label_buf);
+}
+
+/** -----------------------------------------------------------------
+ * ! DEPRECATED
  * A-3: L2 Contention — cross-core, L1-overflow working-sets
  *
  * Configuration:
@@ -361,17 +597,19 @@ void run_exp1_A2(void)
  *   per-task policy), yet that placement itself causes this L2
  *   bandwidth collision — which CAAS cannot predict.
  *-----------------------------------------------------------------*/
-void run_exp1_A3(void)
+void run_exp1_A3_deprecated(void)
 {
   volatile uint8_t * i_bufs[] = {exp1_intf1_buf};
   int i_sizes[] = {WS_L1_FIT};
-  int i_cpus[] = {1};
+  int i_cpus[] = {2};
 
   run_worker_with_interferers(exp1_worker_buf, WS_L1_FIT, 1, i_bufs, i_sizes,
-                              i_cpus, 1, "EXP1 A-3: L2 contention (Core 1+2)");
+                              i_cpus, 1, 1,
+                              "EXP1 A-3: L2 contention (Core 1+2)");
 }
 
-/*-----------------------------------------------------------------
+/** -----------------------------------------------------------------
+ * ! DEPRECATED
  * A-4: L1 + L2 Saturation — 4-core simultaneous flood
  *
  * Configuration:
@@ -404,7 +642,7 @@ void run_exp1_A3(void)
  *   store pressure on the shared L2 is invisible to CA, which is
  *   a single-task, read-centric reuse-distance metric.
  *-----------------------------------------------------------------*/
-void run_exp1_A4(void)
+void run_exp1_A4_deprecated(void)
 {
   volatile uint8_t * i_bufs[] = {exp1_intf1_buf, exp1_intf2_buf,
                                  exp1_intf3_buf};
@@ -412,11 +650,12 @@ void run_exp1_A4(void)
   int i_cpus[] = {1, 2, 3};
 
   run_worker_with_interferers(exp1_worker_buf, WS_L1_FIT, 0, i_bufs, i_sizes,
-                              i_cpus, 3,
+                              i_cpus, 3, 1,
                               "EXP1 A-4: L1+L2 contention (4 cores)");
 }
 
-/*-----------------------------------------------------------------
+/** -----------------------------------------------------------------
+ * ! DEPRECATED
  * A-5: Solo L2-pressure Baseline — large WS, no interference
  *
  * Configuration:
@@ -444,13 +683,14 @@ void run_exp1_A4(void)
  *   A-5 validates that CAAS's high-CA classification is correct for
  *   a task in isolation before cross-core pressure is introduced.
  *-----------------------------------------------------------------*/
-void run_exp1_A5(void)
+void run_exp1_A5_deprecated(void)
 {
-  run_single_worker(exp1_worker_buf, WS_L2_PRESSURE, 0,
+  run_single_worker(exp1_worker_buf, WS_L2_PRESSURE, 0, 1,
                     "EXP1 A-5: Solo large (L2 pressure baseline, Core 0)");
 }
 
-/*-----------------------------------------------------------------
+/** -----------------------------------------------------------------
+ * ! DEPRECATED
  * A-6: L2 Pressure + Cross-core Competition — two high-CA tasks
  *
  * Configuration:
@@ -483,14 +723,14 @@ void run_exp1_A5(void)
  *   falsifies the assumption that per-task CA is sufficient for
  *   placement decisions in a shared-L2 multicore setting.
  *-----------------------------------------------------------------*/
-void run_exp1_A6(void)
+void run_exp1_A6_deprecated(void)
 {
   volatile uint8_t * i_bufs[] = {exp1_intf1_buf};
   int i_sizes[] = {WS_L2_PRESSURE};
   int i_cpus[] = {1};
 
   run_worker_with_interferers(exp1_worker_buf, WS_L2_PRESSURE, 0, i_bufs,
-                              i_sizes, i_cpus, 1,
+                              i_sizes, i_cpus, 1, 1,
                               "EXP1 A-6: L2 pressure (Core 0+1)");
 }
 
@@ -516,9 +756,6 @@ void run_exp1_baseline(void)
 #endif
 #ifdef RUN_A5
   run_exp1_A5();
-#endif
-#ifdef RUN_A6
-  run_exp1_A6();
 #endif
 
   printf("\n=== EXP1: Finished ===\n");
