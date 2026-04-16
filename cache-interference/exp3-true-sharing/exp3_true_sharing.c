@@ -48,9 +48,11 @@
  *   so it cannot distinguish true sharing from independent access.
  *===================================================================== **/
 
-static volatile uint8_t shared_buf[WS_L1_FIT] __attribute__((aligned(4096)));
-static volatile uint8_t ts_worker_buf[WS_L1_FIT] __attribute__((aligned(4096)));
-static volatile uint8_t ts_intf_buf[WS_L1_FIT] __attribute__((aligned(4096)));
+static volatile uint8_t shared_buf[WS_FULL_SIZE] __attribute__((aligned(4096)));
+static volatile uint8_t ts_worker_buf[WS_FULL_SIZE]
+  __attribute__((aligned(4096)));
+static volatile uint8_t ts_intf_buf[WS_FULL_SIZE]
+  __attribute__((aligned(4096)));
 
 typedef struct
 {
@@ -112,8 +114,7 @@ static rtems_task exp3_periodic_task(rtems_task_argument arg)
   uint64_t end_time = rtems_clock_get_uptime_nanoseconds();
   ta->stats->total_exec_ns = end_time - start_time;
 
-  if ((status = rtems_rate_monotonic_delete(period_id)) != 0)
-    exit(1);
+  if ((status = rtems_rate_monotonic_delete(period_id)) != 0) exit(1);
 
   rtems_semaphore_release(ta->done_sem);
   rtems_task_exit();
@@ -122,18 +123,16 @@ static rtems_task exp3_periodic_task(rtems_task_argument arg)
 /* Run consumer (LOAD, worker_arr) + producer (STORE, intf_arr) concurrently.
  * When worker_arr == intf_arr the two tasks access the same cache lines
  * (true sharing); when they differ, only bus bandwidth is shared. */
-static void run_consumer_producer(volatile uint8_t * worker_arr,
-                                  volatile uint8_t * intf_arr,
-                                  int worker_cpu, int intf_cpu,
-                                  const char * label)
+static void run_consumer_producer(volatile uint8_t * worker_buf,
+                                  volatile uint8_t * intf_buf, int worker_cpu,
+                                  int intf_cpu, const char * label)
 {
   rtems_id sem_id, task_worker, task_intf;
 
   printf("--- %s ---\n", label);
 
-  memset((void *)worker_arr, 0, WS_L1_FIT);
-  if (intf_arr != worker_arr)
-    memset((void *)intf_arr, 0, WS_L1_FIT);
+  memset((void *)worker_buf, 0, WS_L1_FIT);
+  if (intf_buf != worker_buf) memset((void *)intf_buf, 0, WS_L1_FIT);
 
   memset(exp3_stats, 0, sizeof(exp3_stats));
 
@@ -156,14 +155,14 @@ static void run_consumer_producer(volatile uint8_t * worker_arr,
   rtems_semaphore_create(rtems_build_name('D', 'N', '3', '0'), 0,
                          RTEMS_COUNTING_SEMAPHORE, 0, &sem_id);
 
-  exp3_args[0].array = worker_arr;
+  exp3_args[0].array = worker_buf;
   exp3_args[0].size = WS_L1_FIT;
   exp3_args[0].done_sem = sem_id;
   exp3_args[0].stats = &exp3_stats[0];
   exp3_args[0].expected_cpu = worker_cpu;
   exp3_args[0].task_name_idx = 0;
 
-  exp3_args[1].array = intf_arr;
+  exp3_args[1].array = intf_buf;
   exp3_args[1].size = WS_L1_FIT;
   exp3_args[1].done_sem = sem_id;
   exp3_args[1].stats = &exp3_stats[1];
@@ -176,11 +175,10 @@ static void run_consumer_producer(volatile uint8_t * worker_arr,
                     &task_worker);
   SET_AFFINITY(task_worker, worker_cpu);
 
-  rtems_task_create(rtems_build_name('I', 'F', '3', '0'),
-                    TASK_PRIORITY_INTERFERER, TASK_STACK_SIZE,
-                    RTEMS_DEFAULT_MODES,
-                    RTEMS_DEFAULT_ATTRIBUTES | RTEMS_FLOATING_POINT,
-                    &task_intf);
+  rtems_task_create(
+    rtems_build_name('I', 'F', '3', '0'), TASK_PRIORITY_INTERFERER,
+    TASK_STACK_SIZE, RTEMS_DEFAULT_MODES,
+    RTEMS_DEFAULT_ATTRIBUTES | RTEMS_FLOATING_POINT, &task_intf);
   SET_AFFINITY(task_intf, intf_cpu);
 
   rtems_task_start(task_worker, exp3_periodic_task,
@@ -197,13 +195,13 @@ static void run_consumer_producer(volatile uint8_t * worker_arr,
   printf("--- %s: Done ---\n", label);
 }
 
-static void run_solo_consumer(volatile uint8_t * arr, int cpu,
+static void run_solo_consumer(volatile uint8_t * buf, int size, int cpu,
                               const char * label)
 {
   rtems_id sem_id, task_id;
 
   printf("--- %s ---\n", label);
-  memset((void *)arr, 0, WS_L1_FIT);
+  memset((void *)buf, 0, size);
   memset(&exp3_stats[0], 0, sizeof(task_stats_t));
 
   exp3_stats[0].role = TASK_ROLE_WORKER;
@@ -211,13 +209,13 @@ static void run_solo_consumer(volatile uint8_t * arr, int cpu,
   exp3_stats[0].task_idx = 0;
   exp3_stats[0].op_type = LOAD_OP;
   exp3_stats[0].n_accesses =
-    NUM_STRESS_ITERATIONS_WORKER * (WS_L1_FIT / L1_LINE_SIZE);
+    NUM_STRESS_ITERATIONS_WORKER * (size / L1_LINE_SIZE);
 
   rtems_semaphore_create(rtems_build_name('D', 'N', '3', '3'), 0,
                          RTEMS_SIMPLE_BINARY_SEMAPHORE, 0, &sem_id);
 
-  exp3_args[0].array = arr;
-  exp3_args[0].size = WS_L1_FIT;
+  exp3_args[0].array = buf;
+  exp3_args[0].size = size;
   exp3_args[0].done_sem = sem_id;
   exp3_args[0].stats = &exp3_stats[0];
   exp3_args[0].expected_cpu = cpu;
@@ -264,7 +262,8 @@ static void run_solo_consumer(volatile uint8_t * arr, int cpu,
 void run_exp3_T1(void)
 {
   run_consumer_producer(shared_buf, shared_buf, 0, 1,
-                        "EXP3 T-1: True sharing (Core 0 LOAD + Core 1 STORE, same array)");
+                        "EXP3 T-1: True sharing (Core 0 LOAD + Core 1 STORE, "
+                        "same array)");
 }
 
 /** -----------------------------------------------------------------
@@ -292,7 +291,8 @@ void run_exp3_T1(void)
 void run_exp3_T2(void)
 {
   run_consumer_producer(ts_worker_buf, ts_intf_buf, 0, 1,
-                        "EXP3 T-2: No sharing (Core 0 LOAD + Core 1 STORE, independent arrays)");
+                        "EXP3 T-2: No sharing (Core 0 LOAD + Core 1 STORE, "
+                        "independent arrays)");
 }
 
 /** -----------------------------------------------------------------
@@ -315,7 +315,7 @@ void run_exp3_T2(void)
  *----------------------------------------------------------------- **/
 void run_exp3_T3(void)
 {
-  run_solo_consumer(shared_buf, 1,
+  run_solo_consumer(shared_buf, WS_L1_FIT, 1,
                     "EXP3 T-3: Solo baseline (Core 1, LOAD only)");
 }
 
