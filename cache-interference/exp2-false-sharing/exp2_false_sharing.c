@@ -35,9 +35,10 @@
  *   → guaranteed separate cache lines, bus bandwidth contention only.
  *
  * Scenario matrix:
- *   F-1  False Sharing   fs_array   Core 0 + Core 1  RMW  cross-core invalidation
- *   F-2  No Sharing      ns_*_buf   Core 0 + Core 1  RMW  independent arrays, bus BW only
- *   F-3  Solo Baseline   fs_array   Core 1 only      RMW  zero interference reference
+ *   F-1  False Sharing   fs_array   Core 0 + Core 1  RMW  cross-core
+ *invalidation F-2  No Sharing      ns_*_buf   Core 0 + Core 1  RMW  independent
+ *arrays, bus BW only F-3  Solo Baseline   fs_array   Core 1 only      RMW  zero
+ *interference reference
  *
  * CAAS limitation demonstrated:
  *   Both F-1 and F-2 tasks have identical per-task WS (WS_L1_FIT).
@@ -62,8 +63,10 @@ typedef struct
 static fs_elem_t fs_array[FS_ELEM_COUNT] __attribute__((aligned(4096)));
 
 /* No-sharing buffers: fully independent cache lines for each task */
-static volatile uint8_t ns_worker_buf[WS_L1_FIT] __attribute__((aligned(4096)));
-static volatile uint8_t ns_intf_buf[WS_L1_FIT] __attribute__((aligned(4096)));
+static volatile uint8_t ns_worker_buf[WS_FULL_SIZE]
+  __attribute__((aligned(4096)));
+static volatile uint8_t ns_intf_buf[WS_FULL_SIZE]
+  __attribute__((aligned(4096)));
 
 typedef struct
 {
@@ -110,7 +113,14 @@ static rtems_task exp2_periodic_task(rtems_task_argument arg)
     assert((int)rtems_scheduler_get_processor() == ta->expected_cpu);
 
     uint64_t t0 = rtems_clock_get_uptime_nanoseconds();
-    rmw_workload(ta->array, ta->size, sweeps);
+    if (ta->stats->op_type == LOAD_OP)
+    {
+      load_workload(ta->array, ta->size, sweeps);
+    }
+    else
+    {
+      store_workload(ta->array, ta->size, sweeps);
+    }
     uint64_t t1 = rtems_clock_get_uptime_nanoseconds();
 
     record_tat(ta->stats, t1 - t0);
@@ -118,8 +128,7 @@ static rtems_task exp2_periodic_task(rtems_task_argument arg)
   uint64_t end_time = rtems_clock_get_uptime_nanoseconds();
   ta->stats->total_exec_ns = end_time - start_time;
 
-  if ((status = rtems_rate_monotonic_delete(period_id)) != 0)
-    exit(1);
+  if ((status = rtems_rate_monotonic_delete(period_id)) != 0) exit(1);
 
   rtems_semaphore_release(ta->done_sem);
   rtems_task_exit();
@@ -140,14 +149,14 @@ static void run_two_tasks(volatile uint8_t * a_arr, volatile uint8_t * b_arr,
   exp2_stats[0].role = TASK_ROLE_WORKER;
   exp2_stats[0].cpu_id = a_cpu;
   exp2_stats[0].task_idx = 0;
-  exp2_stats[0].op_type = RMW_OP;
+  exp2_stats[0].op_type = LOAD_OP;
   exp2_stats[0].n_accesses =
     NUM_STRESS_ITERATIONS_WORKER * (WS_L1_FIT / L1_LINE_SIZE);
 
   exp2_stats[1].role = TASK_ROLE_INTERFERER;
   exp2_stats[1].cpu_id = b_cpu;
   exp2_stats[1].task_idx = 1;
-  exp2_stats[1].op_type = RMW_OP;
+  exp2_stats[1].op_type = STORE_OP;
   exp2_stats[1].n_accesses =
     NUM_STRESS_ITERATIONS_INTERFERER * (WS_L1_FIT / L1_LINE_SIZE);
 
@@ -173,8 +182,9 @@ static void run_two_tasks(volatile uint8_t * a_arr, volatile uint8_t * b_arr,
                     RTEMS_DEFAULT_ATTRIBUTES | RTEMS_FLOATING_POINT, &task_a);
   SET_AFFINITY(task_a, a_cpu);
 
-  rtems_task_create(rtems_build_name('I', 'F', '2', '0'), TASK_PRIORITY_INTERFERER,
-                    TASK_STACK_SIZE, RTEMS_DEFAULT_MODES,
+  rtems_task_create(rtems_build_name('I', 'F', '2', '0'),
+                    TASK_PRIORITY_INTERFERER, TASK_STACK_SIZE,
+                    RTEMS_DEFAULT_MODES,
                     RTEMS_DEFAULT_ATTRIBUTES | RTEMS_FLOATING_POINT, &task_b);
   SET_AFFINITY(task_b, b_cpu);
 
