@@ -1,1 +1,0 @@
-/opt/rtems/6/bin/rtems-run --user-config=/opt/test_config.ini --rtems-bsp=gr740-sis ./hello.exe
