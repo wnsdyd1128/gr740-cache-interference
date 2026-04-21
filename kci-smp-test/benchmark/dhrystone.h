@@ -9,7 +9,7 @@ typedef struct dhrystone_context_t dhrystone_context_t;
 /*=====================================================================
  * Dhrystone data type definitions
  *=====================================================================*/
-#define DHRYSTONE_SIZE 50
+#define DHRYSTONE_SIZE 150
 #define Null 0
 #define true 1
 #define false 0

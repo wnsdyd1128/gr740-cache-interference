@@ -167,6 +167,7 @@ void dhrystone_init(dhrystone_context_t * ctx)
          "DHRYSTONE PROGRAM, SOME STRING");
   strcpy(ctx->str_1_loc, "DHRYSTONE PROGRAM, 1'ST STRING");
 
+  ctx->arr_dim = (ctx->config.arr_dim > 0) ? ctx->config.arr_dim : 50;
   ctx->arr_2_glob[8][7] = 10;
   ctx->throughput = 0;
 }

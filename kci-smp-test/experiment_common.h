@@ -124,7 +124,8 @@ typedef struct dhrystone_context_t
   char        ch_1_glob;
   char        ch_2_glob;
   Arr_1_Dim   arr_1_glob;
-  Arr_2_Dim   arr_2_glob;
+  Arr_2_Dim   arr_2_glob; /* [DHRYSTONE_SIZE][DHRYSTONE_SIZE]; sweep up to arr_dim */
+  int         arr_dim;    /* active dimension (set by dhrystone_init, default 50) */
 
   /* Dhrystone string seeds */
   Str_30 str_1_loc;
