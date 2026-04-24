@@ -54,23 +54,24 @@ Victim의 `op_type`은 불필요하다 — dhrystone 자체가 이미 load/store
 
 ---
 
-## 현재 코드 상태 (2026-04-21)
+## 현재 코드 상태 (2026-04-24)
 
 ### `benchmark/dhrystone.h`
-- `op_type_t` 정의 (LOAD_OP / STORE_OP / RMW_OP)
-- `dhrystone_config_t`: `op_type`, `num_iterations`, `working_set_size`
-  - **`op_type`과 `working_set_size`는 victim에 불필요 — 제거 예정**
+- `op_type_t` 정의 (LOAD_OP / STORE_OP / RMW_OP) — aggressor용으로 유지
+- `dhrystone_config_t`: `arr_dim`, `num_iterations` (victim 필요 필드만 남김)
+- `DHRYSTONE_SIZE` = 150 (정적 배열이 최대 arr_dim=150을 수용)
 - `dhrystone_init()` / `run_dhrystone_workload()` 선언
 
 ### `benchmark/dhrystone.c`
 - context 기반 `dhry_func_1~3`, `dhry_proc_1~8` 구현 (원본과 동작 동일, 검증 완료)
-- `dhrystone_init`: `ptr_glob`/`next_ptr_glob` malloc, 초기 시드값 설정, `working_set_buf` 할당
-- `run_dhrystone_workload`: `num_iterations`회 dhrystone 루프 수행 후 `working_set_buf` sweep
-  - **`working_set_buf` sweep 부분은 폐기 예정**
+- `dhrystone_init`: `ptr_glob`/`next_ptr_glob` malloc, 초기 시드값 설정, `ctx->arr_dim` 세팅
+- `run_dhrystone_workload`: `num_iterations`회 dhrystone 루프 수행 (원본 proc_8 그대로)
+- `working_set_buf` sweep 로직 제거 완료
 
 ### `experiment_common.h`
-- `dhrystone_context_t`에 `config`, `working_set_buf` 필드 포함
-  - **`config.op_type`, `config.working_set_size`, `working_set_buf` 제거 예정**
+- `dhrystone_context_t`: `config` + `arr_dim` + dhrystone 데이터 구조
+  - `Arr_2_Dim arr_2_glob[150][150]` — 정적 배열, sweep 확장 시 arr_dim까지만 순회
+  - `working_set_buf` 제거 완료
 
 ### `exp0-baseline/`
 - 현재 stub — 실험 로직 없음
@@ -90,82 +91,78 @@ Victim의 `op_type`은 불필요하다 — dhrystone 자체가 이미 load/store
 
 ---
 
-## Next Steps (우선순위 순)
+## 실험 시나리오
 
-### 1. `dhrystone_config_t` 및 `dhrystone_context_t` 정리
+### 설계 기조
 
-`op_type`/`working_set_size`/`working_set_buf`를 victim 설계에서 제거한다.
+- **Primary axis (aggressor intensity)**: aggressor working-set 크기 변화 → 캐시 간섭 강도
+- **Secondary axis (victim memory intensity)**: dhrystone arr_dim 변화 → victim의 캐시 의존도
 
-```c
-/* dhrystone.h */
-typedef struct {
-  int arr_dim;        /* Arr_2_Dim 한 변의 크기. 기본 50. working-set = arr_dim^2 * 4 bytes */
-  int num_iterations; /* 루프 반복 횟수 */
-} dhrystone_config_t;
+### 기본 실험: exp1-dhry-vs-sweep
+
+```
+Core 0 (victim)    : dhrystone, arr_dim=50 (고정, ~10KB)
+Core 1 (aggressor) : cache sweep, WS 변화
 ```
 
-### 2. `Arr_2_Dim` 동적 할당으로 교체
-
-`experiment_common.h`의 `dhrystone_context_t`:
-
-```c
-/* 기존 — 정적 배열 */
-Arr_2_Dim arr_2_glob;      /* int[50][50] = 10KB 고정 */
-
-/* 변경 — 동적 flat array */
-int * arr_2_glob;          /* 동적 할당: arr_dim * arr_dim * sizeof(int) */
-int   arr_dim;             /* 실제 차원 (dhrystone_init에서 설정) */
-```
-
-`dhrystone_init`에서 `malloc(arr_dim * arr_dim * sizeof(int))`.
-
-### 3. `dhry_proc_8`을 전체 배열 sweep으로 변경
-
-```c
-static void dhry_proc_8(dhrystone_context_t * ctx, int v1, int v2)
-{
-  int N = ctx->arr_dim;
-  /* 원본 고정 인덱스 접근 (dhrystone 특성 유지) */
-  int loc = v1 + 5;  /* = 8 */
-  ctx->arr_1_glob[loc]     = v2;
-  ctx->arr_1_glob[loc + 1] = ctx->arr_1_glob[loc];
-  ctx->arr_1_glob[loc + 30] = loc;
-
-  /* working-set 확장: arr_dim이 클수록 더 많은 캐시 라인을 터치 */
-  for (int row = 0; row + 20 < N; row += L1_LINE_SIZE / sizeof(int))
-  {
-    ctx->arr_2_glob[row * N + (row % N)]       = loc;
-    ctx->arr_2_glob[row * N + (row % N) + 1]   = loc;
-    ctx->arr_2_glob[row * N + (row % N) - 1]   += 1;
-    ctx->arr_2_glob[(row + 20) * N + (row % N)] = ctx->arr_1_glob[loc];
-  }
-  ctx->int_glob = 5;
-}
-```
-
-### 4. 실험 행렬 구현
-
-| Victim `arr_dim` | WS (Arr_2_Dim) | 캐시 위치 |
-|-----------------|----------------|----------|
-| 50 | ~10KB | L1 내부 |
-| 100 | ~40KB | L1 초과, L2 내부 |
-| 150 | ~90KB | L2 내부 |
+**Aggressor intensity 축:**
 
 | Aggressor WS | 상수 | 간섭 강도 |
 |-------------|------|---------|
+| 0 | — | baseline (간섭 없음) |
 | ~11.5KB | `WS_L1_FIT` | L1 부분 점유 |
 | 32KB | `WS_L1_EXCEED` | L1 완전 thrash |
 | 512KB | `WS_L2_QUARTER` | L2 1/4 점유 |
 | ~819KB | `WS_L2_PRESSURE` | L2 heavy pressure |
 
-각 셀 = (victim arr_dim) × (aggressor WS) × (aggressor op_type) 조합의 독립 실험.
+각 WS마다 op_type = LOAD / STORE / RMW 세 가지로 반복.
 
-### 5. exp1 구현
+**측정:** victim TAT (min/avg/max/avg_w/o_loop_overhead), deadline miss ratio
+
+### 확장 실험: exp2-dhry-ws-sensitivity
+
+기본 실험 완료 후, victim arr_dim을 변화시켜 캐시 tier별 간섭 취약도 비교:
+
+| Victim `arr_dim` | WS | 위치 | 예상 특성 |
+|-----------------|-----|------|---------|
+| 50 | ~10KB | L1 내 | L1 thrash에 민감, L2 간섭엔 둔감 |
+| 100 | ~40KB | L2 내 | L2 간섭에 민감 |
+| 150 | ~90KB | L2 내 (heavy) | 모든 구간에서 취약 |
+
+각 arr_dim에서 기본 실험과 동일한 aggressor intensity 행렬 반복.
+
+> **구현 참고**: arr_dim > 50일 때 dhrystone 원본 proc_8은 arr_2_glob의 극히 일부(고정 인덱스)만 접근한다. arr_dim에 비례한 working-set 확보가 필요하면 `run_dhrystone_workload` 루프 이후 arr_2_glob 별도 sweep 추가를 검토한다.
+
+---
+
+## Next Steps (우선순위 순)
+
+### 1. exp1 구현 ← 당장
 
 `exp0-baseline/`을 참고해 `exp1-dhry-vs-sweep/` 생성:
-- Victim: Core 0, dhrystone (`arr_dim` 변화)
+- Victim: Core 0, dhrystone (`arr_dim=50`, `num_iterations` 고정)
 - Aggressor: Core 1, cache sweep (`WS_*` 변화, `op_type` 변화)
-- 측정: Victim TAT (min/avg/max), `time_per_access`
+- baseline 측정 포함 (aggressor 없이 victim만 실행)
+- 측정: Victim TAT (min/avg/max), deadline miss ratio
+
+### 2. proc_8 sweep 확장 (exp2 준비 시)
+
+victim working-set을 arr_dim에 비례하게 하려면 `run_dhrystone_workload` 루프 **이후** arr_2_glob sweep 추가:
+
+```c
+/* dhrystone 루프 완료 후 */
+int N = ctx->arr_dim;
+for (int row = 0; row < N; row++)
+  for (int col = 0; col < N; col += L1_LINE_SIZE / sizeof(int))
+    ctx->arr_2_glob[row][col] = 0;
+```
+
+- proc_8 원본 유지 (dhrystone 혼합 연산 특성 보존)
+- sweep은 사후 별도 단계 — 재현성 및 결정론 문제 없음
+
+### 3. exp2 구현
+
+exp1 결과 확인 후 arr_dim = 50 / 100 / 150으로 victim WS sensitivity 분석.
 
 ---
 
